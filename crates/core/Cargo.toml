@@ -1,0 +1,20 @@
+[package]
+name = "relascope-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+globset.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

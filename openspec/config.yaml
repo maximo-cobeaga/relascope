@@ -1,0 +1,45 @@
+strict_tdd: false
+context: |
+  relascope is a Rust software project.
+  Relascope 0.0.1 uses a Cargo workspace with core, storage-sqlite, and cli crates.
+  Unit and integration tests should run with cargo test once Rust/Cargo is available in PATH.
+rules:
+  proposal:
+    require_problem_statement: true
+  spec:
+    require_acceptance_criteria: true
+  design:
+    require_tradeoffs: true
+  tasks:
+    protect_review_workload: true
+  apply:
+    test_command: "cargo test"
+  verify:
+    test_command: "cargo test"
+testing:
+  detected: "2026-07-11"
+  runner:
+    command: "cargo test"
+    framework: "cargo"
+  layers:
+    unit: "cargo test"
+    integration: "cargo test"
+    e2e: ""
+  commands:
+    unit:
+      - "cargo test"
+    integration:
+      - "cargo test"
+    e2e: []
+  coverage:
+    command: ""
+    commands: []
+quality:
+  lint: ""
+  lint_commands: []
+  typecheck: "cargo test"
+  typecheck_commands:
+    - "cargo test"
+  format: "cargo fmt"
+  format_commands:
+    - "cargo fmt"

@@ -1,0 +1,1 @@
+Plain text fixture note. This should be inventoried as unknown in 0.0.1.
