@@ -2,7 +2,7 @@
 
 Relascope is a local-first cross-repository architecture inventory and impact-analysis tool.
 
-This repository currently implements the first local-first engine milestones through **Relascope 0.0.3-b — Real Workspace Dogfooding**.
+This repository currently implements the first local-first engine milestones through **Relascope 0.0.3-c — Scan Progress Visibility**.
 
 ## Current Scope
 

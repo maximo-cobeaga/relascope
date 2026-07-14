@@ -1,6 +1,6 @@
 # Relascope — Current State and Next Steps
 
-This document summarizes the current Relascope state after closing the early local-first milestones and opening the current dogfooding polish slice.
+This document summarizes the current Relascope state after closing the early local-first milestones through the scan progress visibility slice.
 
 ## Current state
 
@@ -15,12 +15,7 @@ Closed milestones:
 | `0.0.2-b — Shallow Module and Import Detection` | Closed | `Module`, `IMPORTS`, line evidence, `graph imports` |
 | `0.0.3-a — Incremental Scan State and Stale Graph Marking` | Closed | Added/modified/removed counts and stale graph facts |
 | `0.0.3-b — Real Workspace Dogfooding` | Closed | `repo list`, `repo remove`, `doctor`, experimental JSON, dogfooding docs |
-
-Active slice:
-
-| Milestone | Status | Goal |
-|---|---:|---|
-| `0.0.3-c — Scan Progress Visibility` | Active OpenSpec change | Show scan progress on large repositories and mark interrupted scans as `cancelled` |
+| `0.0.3-c — Scan Progress Visibility` | Closed | Progress visibility for long scans, post-scan materialization progress, `--silent`, clean JSON, and handled cancellation state |
 
 ## What Relascope can do today
 
@@ -62,11 +57,17 @@ relascope repo list
 relascope scan
 ```
 
-The current active slice adds progress visibility for large scans:
+Relascope shows progress for large scans and post-scan materialization:
 
 ```text
 Scanning repositories...
   backend: 500 files indexed, 120 skipped, elapsed 00:00:03
+Persisting inventory...
+Marking stale graph facts...
+Materializing graph...
+  graph: 500/18605 files, 4/4 repositories, elapsed 00:00:03
+Materializing shallow imports...
+  imports backend: 250/5861 code files, 1200 imports, elapsed 00:00:30
 ```
 
 Use `--silent` for concise output:
@@ -127,33 +128,17 @@ pwsh -ExecutionPolicy Bypass -File scripts/smoke-graph.ps1
 | Shallow module imports | `openspec/specs/shallow-module-imports/spec.md` |
 | Incremental stale graph | `openspec/specs/incremental-stale-graph/spec.md` |
 | Real workspace dogfooding | `openspec/specs/real-workspace-dogfooding/spec.md` |
+| Scan progress visibility | `openspec/specs/scan-progress-visibility/spec.md` |
 
-Active change under development:
-
-```text
-openspec/changes/relascope-0-0-3-c-scan-progress-visibility/
-```
+No active OpenSpec change is currently under development.
 
 ## Recommended next steps
 
-1. Complete the pending manual dogfooding checks for `0.0.3-c`:
-   - rebuild the CLI;
-   - run `relascope scan` on the ReservApp dogfood workspace;
-   - confirm progress appears during large scans;
-   - test Ctrl+C while scan is active;
-   - confirm `doctor` / `status` show `cancelled`;
-   - re-run scan and confirm it can complete afterward;
-   - confirm `scan --format json > scan.json` stays JSON-only.
-2. Capture evidence: scan duration, expensive repos, unresolved imports, stale behavior, false positives, false negatives, and UX friction.
-3. If dogfooding passes, create the verify report, sync the active spec, and archive `relascope-0-0-3-c-scan-progress-visibility`.
-4. If dogfooding is usable after archive, move to the next parser foundation slice, likely `0.0.4 — Tree-sitter Parser Foundation`.
+1. Consider a focused progress-polish slice, for example `0.0.3-d — Compact Progress Output`, so large scans do not print hundreds of heartbeat lines by default.
+2. Consider stale `running` scan cleanup for hard process kills or terminal closes.
+3. Use dogfooding evidence to guide import filtering and resolution improvements; the ReservApp run produced 32,646 unverified imports.
+4. Move toward the next parser foundation slice, likely `0.0.4 — Tree-sitter Parser Foundation`, before impact analysis.
 5. Do not jump to impact analysis before improving parser confidence and validating real workspace behavior.
-
-Detailed handoff for tomorrow:
-
-```text
-openspec/changes/relascope-0-0-3-c-scan-progress-visibility/handoff.md
-```
 
 ## Scope still intentionally excluded
 

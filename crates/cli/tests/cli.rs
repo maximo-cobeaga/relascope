@@ -365,6 +365,10 @@ fn scan_progress_is_default_and_silent_suppresses_it() {
         .success()
         .stdout(predicate::str::contains("Scanning repositories..."))
         .stdout(predicate::str::contains("api:"))
+        .stdout(predicate::str::contains("Persisting inventory..."))
+        .stdout(predicate::str::contains("Materializing graph..."))
+        .stdout(predicate::str::contains("graph:"))
+        .stdout(predicate::str::contains("Materializing shallow imports..."))
         .stdout(predicate::str::contains("Scan completed"));
 
     relascope()
@@ -373,6 +377,8 @@ fn scan_progress_is_default_and_silent_suppresses_it() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Scanning repositories...").not())
+        .stdout(predicate::str::contains("Materializing graph...").not())
+        .stdout(predicate::str::contains("Materializing shallow imports...").not())
         .stdout(predicate::str::contains("Scan completed"));
 }
 

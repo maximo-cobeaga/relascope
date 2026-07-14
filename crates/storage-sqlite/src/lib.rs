@@ -3,9 +3,10 @@ use relascope_core::{
     contains_edge_id, detect_imports, evidence_id, file_node_id, imports_edge_id, module_node_id,
     repository_node_id, unresolved_module_node_id, workspace_node_id, FileChangeSummary,
     FileInventoryRecord, GraphEdge, GraphEvidence, GraphNode, GraphSummary, ImportFact,
-    PreviousFileState, RepositoryRecord, ScanSummary, WorkspaceConfig, NODE_KIND_FILE,
-    NODE_KIND_MODULE, NODE_KIND_REPOSITORY, NODE_KIND_WORKSPACE, ORIGIN_DETERMINISTIC,
-    RELATION_CONTAINS, RELATION_IMPORTS, STATUS_ACTIVE, STATUS_STALE, STATUS_UNVERIFIED,
+    PreviousFileState, RepositoryRecord, ScanCancellationToken, ScanSummary, WorkspaceConfig,
+    NODE_KIND_FILE, NODE_KIND_MODULE, NODE_KIND_REPOSITORY, NODE_KIND_WORKSPACE,
+    ORIGIN_DETERMINISTIC, RELATION_CONTAINS, RELATION_IMPORTS, STATUS_ACTIVE, STATUS_STALE,
+    STATUS_UNVERIFIED,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -14,6 +15,7 @@ use sqlx::{Row, SqlitePool};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -26,6 +28,54 @@ pub enum StorageError {
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
+
+const GRAPH_MATERIALIZATION_FILE_PROGRESS_INTERVAL: u64 = 500;
+const GRAPH_MATERIALIZATION_TIME_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+const IMPORT_MATERIALIZATION_FILE_PROGRESS_INTERVAL: u64 = 100;
+const IMPORT_MATERIALIZATION_IMPORT_PROGRESS_INTERVAL: u64 = 500;
+const IMPORT_MATERIALIZATION_TIME_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone)]
+pub struct MinimalGraphMaterializationProgress {
+    pub files_processed: u64,
+    pub total_files: u64,
+    pub repositories_processed: u64,
+    pub total_repositories: u64,
+    pub elapsed: Duration,
+}
+
+pub trait MinimalGraphMaterializationProgressReporter {
+    fn report(&mut self, progress: MinimalGraphMaterializationProgress);
+}
+
+pub struct NoopMinimalGraphMaterializationProgressReporter;
+
+impl MinimalGraphMaterializationProgressReporter
+    for NoopMinimalGraphMaterializationProgressReporter
+{
+    fn report(&mut self, _progress: MinimalGraphMaterializationProgress) {}
+}
+
+#[derive(Debug, Clone)]
+pub struct ShallowImportMaterializationProgress {
+    pub repository_visible_id: String,
+    pub files_processed: u64,
+    pub total_code_files: u64,
+    pub imports_materialized: u64,
+    pub elapsed: Duration,
+}
+
+pub trait ShallowImportMaterializationProgressReporter {
+    fn report(&mut self, progress: ShallowImportMaterializationProgress);
+}
+
+pub struct NoopShallowImportMaterializationProgressReporter;
+
+impl ShallowImportMaterializationProgressReporter
+    for NoopShallowImportMaterializationProgressReporter
+{
+    fn report(&mut self, _progress: ShallowImportMaterializationProgress) {}
+}
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -473,6 +523,49 @@ impl SqliteStore {
         files: &[FileInventoryRecord],
         scan_id: &str,
     ) -> Result<()> {
+        let mut reporter = NoopMinimalGraphMaterializationProgressReporter;
+        self.materialize_minimal_graph_with_control(
+            config,
+            repositories,
+            files,
+            scan_id,
+            None,
+            &mut reporter,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn materialize_minimal_graph_with_control(
+        &self,
+        config: &WorkspaceConfig,
+        repositories: &[RepositoryRecord],
+        files: &[FileInventoryRecord],
+        scan_id: &str,
+        cancellation_token: Option<&ScanCancellationToken>,
+        reporter: &mut dyn MinimalGraphMaterializationProgressReporter,
+    ) -> Result<bool> {
+        if storage_scan_cancelled(cancellation_token) {
+            return Ok(true);
+        }
+
+        let started_at = Instant::now();
+        let total_files = files.len() as u64;
+        let total_repositories = repositories.len() as u64;
+        let mut files_processed = 0_u64;
+        let mut repositories_processed = 0_u64;
+        let mut last_report_at = Instant::now();
+        let mut last_reported_files = 0_u64;
+
+        report_minimal_graph_progress(
+            reporter,
+            files_processed,
+            total_files,
+            repositories_processed,
+            total_repositories,
+            started_at.elapsed(),
+        );
+
         let workspace_node_id = workspace_node_id(&config.workspace.id);
         self.upsert_node(&GraphNode {
             id: workspace_node_id.clone(),
@@ -488,6 +581,10 @@ impl SqliteStore {
         .await?;
 
         for repository in repositories {
+            if storage_scan_cancelled(cancellation_token) {
+                return Ok(true);
+            }
+
             let repository_node_id = repository_node_id(&config.workspace.id, &repository.id);
             self.upsert_node(&GraphNode {
                 id: repository_node_id.clone(),
@@ -544,9 +641,14 @@ impl SqliteStore {
                 .to_string(),
             })
             .await?;
+            repositories_processed += 1;
         }
 
         for file in files {
+            if storage_scan_cancelled(cancellation_token) {
+                return Ok(true);
+            }
+
             let Some(repository) = repositories
                 .iter()
                 .find(|repo| repo.id.as_str() == file.repository_id.as_str())
@@ -610,9 +712,36 @@ impl SqliteStore {
                     .to_string(),
             })
             .await?;
+
+            files_processed += 1;
+            if should_report_minimal_graph_progress(
+                files_processed,
+                last_reported_files,
+                last_report_at,
+            ) {
+                report_minimal_graph_progress(
+                    reporter,
+                    files_processed,
+                    total_files,
+                    repositories_processed,
+                    total_repositories,
+                    started_at.elapsed(),
+                );
+                last_report_at = Instant::now();
+                last_reported_files = files_processed;
+            }
         }
 
-        Ok(())
+        report_minimal_graph_progress(
+            reporter,
+            files_processed,
+            total_files,
+            repositories_processed,
+            total_repositories,
+            started_at.elapsed(),
+        );
+
+        Ok(false)
     }
 
     pub async fn materialize_shallow_imports(
@@ -622,9 +751,36 @@ impl SqliteStore {
         files: &[FileInventoryRecord],
         scan_id: &str,
     ) -> Result<()> {
+        let mut reporter = NoopShallowImportMaterializationProgressReporter;
+        self.materialize_shallow_imports_with_control(
+            config,
+            repositories,
+            files,
+            scan_id,
+            None,
+            &mut reporter,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn materialize_shallow_imports_with_control(
+        &self,
+        config: &WorkspaceConfig,
+        repositories: &[RepositoryRecord],
+        files: &[FileInventoryRecord],
+        scan_id: &str,
+        cancellation_token: Option<&ScanCancellationToken>,
+        reporter: &mut dyn ShallowImportMaterializationProgressReporter,
+    ) -> Result<bool> {
         let files_by_repository = files_by_repository(files);
+        let started_at = Instant::now();
 
         for repository in repositories {
+            if storage_scan_cancelled(cancellation_token) {
+                return Ok(true);
+            }
+
             let Some(repository_files) = files_by_repository.get(&repository.id) else {
                 continue;
             };
@@ -641,30 +797,111 @@ impl SqliteStore {
                 .filter(|file| is_supported_code_language(file.language.as_deref()))
                 .copied()
                 .collect::<Vec<_>>();
+            let total_code_files = code_files.len() as u64;
+            let mut files_processed = 0_u64;
+            let mut imports_materialized = 0_u64;
+            let mut last_report_at = Instant::now();
+            let mut last_reported_files = 0_u64;
+            let mut last_reported_imports = 0_u64;
+
+            if total_code_files > 0 {
+                report_shallow_import_progress(
+                    reporter,
+                    repository,
+                    files_processed,
+                    total_code_files,
+                    imports_materialized,
+                    started_at.elapsed(),
+                );
+            }
 
             for file in &code_files {
+                if storage_scan_cancelled(cancellation_token) {
+                    return Ok(true);
+                }
                 self.materialize_source_module(config, repository, file, scan_id)
                     .await?;
             }
 
             for file in code_files {
+                if storage_scan_cancelled(cancellation_token) {
+                    return Ok(true);
+                }
+
                 let absolute_path = repository
                     .path
                     .join(path_from_relative(&file.relative_path));
                 let Ok(content) = fs::read_to_string(&absolute_path) else {
+                    files_processed += 1;
                     continue;
                 };
                 let language = file.language.as_deref().unwrap_or_default();
                 let import_facts =
                     detect_imports(&file.relative_path, language, &content, &known_files);
                 for fact in import_facts {
+                    if storage_scan_cancelled(cancellation_token) {
+                        return Ok(true);
+                    }
                     self.materialize_import_fact(config, repository, file, &fact, scan_id)
                         .await?;
+                    imports_materialized += 1;
+
+                    if should_report_shallow_import_progress(
+                        files_processed,
+                        imports_materialized,
+                        last_reported_files,
+                        last_reported_imports,
+                        last_report_at,
+                    ) {
+                        report_shallow_import_progress(
+                            reporter,
+                            repository,
+                            files_processed,
+                            total_code_files,
+                            imports_materialized,
+                            started_at.elapsed(),
+                        );
+                        last_report_at = Instant::now();
+                        last_reported_files = files_processed;
+                        last_reported_imports = imports_materialized;
+                    }
                 }
+                files_processed += 1;
+
+                if should_report_shallow_import_progress(
+                    files_processed,
+                    imports_materialized,
+                    last_reported_files,
+                    last_reported_imports,
+                    last_report_at,
+                ) {
+                    report_shallow_import_progress(
+                        reporter,
+                        repository,
+                        files_processed,
+                        total_code_files,
+                        imports_materialized,
+                        started_at.elapsed(),
+                    );
+                    last_report_at = Instant::now();
+                    last_reported_files = files_processed;
+                    last_reported_imports = imports_materialized;
+                }
+            }
+
+            if total_code_files > 0 {
+                report_shallow_import_progress(
+                    reporter,
+                    repository,
+                    files_processed,
+                    total_code_files,
+                    imports_materialized,
+                    started_at.elapsed(),
+                );
             }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     async fn materialize_source_module(
@@ -1257,6 +1494,68 @@ fn display_name_for_file(relative_path: &str) -> String {
         .to_string()
 }
 
+fn storage_scan_cancelled(cancellation_token: Option<&ScanCancellationToken>) -> bool {
+    cancellation_token.is_some_and(ScanCancellationToken::is_cancelled)
+}
+
+fn should_report_minimal_graph_progress(
+    files_processed: u64,
+    last_reported_files: u64,
+    last_report_at: Instant,
+) -> bool {
+    files_processed.saturating_sub(last_reported_files)
+        >= GRAPH_MATERIALIZATION_FILE_PROGRESS_INTERVAL
+        || last_report_at.elapsed() >= GRAPH_MATERIALIZATION_TIME_PROGRESS_INTERVAL
+}
+
+fn report_minimal_graph_progress(
+    reporter: &mut dyn MinimalGraphMaterializationProgressReporter,
+    files_processed: u64,
+    total_files: u64,
+    repositories_processed: u64,
+    total_repositories: u64,
+    elapsed: Duration,
+) {
+    reporter.report(MinimalGraphMaterializationProgress {
+        files_processed,
+        total_files,
+        repositories_processed,
+        total_repositories,
+        elapsed,
+    });
+}
+
+fn should_report_shallow_import_progress(
+    files_processed: u64,
+    imports_materialized: u64,
+    last_reported_files: u64,
+    last_reported_imports: u64,
+    last_report_at: Instant,
+) -> bool {
+    files_processed.saturating_sub(last_reported_files)
+        >= IMPORT_MATERIALIZATION_FILE_PROGRESS_INTERVAL
+        || imports_materialized.saturating_sub(last_reported_imports)
+            >= IMPORT_MATERIALIZATION_IMPORT_PROGRESS_INTERVAL
+        || last_report_at.elapsed() >= IMPORT_MATERIALIZATION_TIME_PROGRESS_INTERVAL
+}
+
+fn report_shallow_import_progress(
+    reporter: &mut dyn ShallowImportMaterializationProgressReporter,
+    repository: &RepositoryRecord,
+    files_processed: u64,
+    total_code_files: u64,
+    imports_materialized: u64,
+    elapsed: Duration,
+) {
+    reporter.report(ShallowImportMaterializationProgress {
+        repository_visible_id: repository.visible_id.clone(),
+        files_processed,
+        total_code_files,
+        imports_materialized,
+        elapsed,
+    });
+}
+
 fn files_by_repository(
     files: &[FileInventoryRecord],
 ) -> HashMap<String, Vec<&FileInventoryRecord>> {
@@ -1393,6 +1692,131 @@ mod tests {
         assert_eq!(imports.len(), 2);
         assert!(imports.iter().any(|import| import.line == Some(1)));
         assert!(imports.iter().any(|import| import.line == Some(2)));
+    }
+
+    #[tokio::test]
+    async fn minimal_graph_materialization_stops_when_cancelled() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        let repo_dir = dir.path().join("api-python");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let config = WorkspaceConfig::new("workspace-id".to_string(), "test".to_string());
+        let store = SqliteStore::open(&db).await.unwrap();
+        store.upsert_workspace(&config, dir.path()).await.unwrap();
+        let repository = store
+            .add_repository(&config.workspace.id, "api", "api-python", &repo_dir)
+            .await
+            .unwrap();
+        let files = vec![FileInventoryRecord {
+            id: "file-row-1".to_string(),
+            workspace_id: config.workspace.id.clone(),
+            repository_id: repository.id.clone(),
+            relative_path: "app.py".to_string(),
+            kind: "code".to_string(),
+            language: Some("python".to_string()),
+            size_bytes: Some(10),
+            content_hash: Some("hash-1".to_string()),
+            modified_at: None,
+            scan_id: "scan-1".to_string(),
+            metadata_json: "{}".to_string(),
+        }];
+        let cancellation = ScanCancellationToken::default();
+        cancellation.cancel();
+        let mut reporter = NoopMinimalGraphMaterializationProgressReporter;
+
+        let cancelled = store
+            .materialize_minimal_graph_with_control(
+                &config,
+                &[repository],
+                &files,
+                "scan-1",
+                Some(&cancellation),
+                &mut reporter,
+            )
+            .await
+            .unwrap();
+
+        assert!(cancelled);
+        let summary = store.graph_summary(&config.workspace.id).await.unwrap();
+        assert!(!summary.has_graph());
+    }
+
+    #[tokio::test]
+    async fn shallow_import_materialization_stops_when_cancelled() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        let repo_dir = dir.path().join("web-typescript");
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::write(
+            repo_dir.join("src/main.ts"),
+            "import { message } from './message';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo_dir.join("src/message.ts"),
+            "export const message = 'hello';\n",
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::new("workspace-id".to_string(), "test".to_string());
+        let store = SqliteStore::open(&db).await.unwrap();
+        store.upsert_workspace(&config, dir.path()).await.unwrap();
+        let repository = store
+            .add_repository(&config.workspace.id, "web", "web-typescript", &repo_dir)
+            .await
+            .unwrap();
+        let files = vec![
+            FileInventoryRecord {
+                id: "file-row-1".to_string(),
+                workspace_id: config.workspace.id.clone(),
+                repository_id: repository.id.clone(),
+                relative_path: "src/main.ts".to_string(),
+                kind: "code".to_string(),
+                language: Some("typescript".to_string()),
+                size_bytes: Some(50),
+                content_hash: Some("hash-1".to_string()),
+                modified_at: None,
+                scan_id: "scan-1".to_string(),
+                metadata_json: "{}".to_string(),
+            },
+            FileInventoryRecord {
+                id: "file-row-2".to_string(),
+                workspace_id: config.workspace.id.clone(),
+                repository_id: repository.id.clone(),
+                relative_path: "src/message.ts".to_string(),
+                kind: "code".to_string(),
+                language: Some("typescript".to_string()),
+                size_bytes: Some(30),
+                content_hash: Some("hash-2".to_string()),
+                modified_at: None,
+                scan_id: "scan-1".to_string(),
+                metadata_json: "{}".to_string(),
+            },
+        ];
+
+        store
+            .materialize_minimal_graph(&config, &[repository.clone()], &files, "scan-1")
+            .await
+            .unwrap();
+        let cancellation = ScanCancellationToken::default();
+        cancellation.cancel();
+        let mut reporter = NoopShallowImportMaterializationProgressReporter;
+
+        let cancelled = store
+            .materialize_shallow_imports_with_control(
+                &config,
+                &[repository],
+                &files,
+                "scan-1",
+                Some(&cancellation),
+                &mut reporter,
+            )
+            .await
+            .unwrap();
+
+        assert!(cancelled);
+        let summary = store.graph_summary(&config.workspace.id).await.unwrap();
+        assert_eq!(summary.edges_by_relation.get(RELATION_IMPORTS), None);
     }
 
     #[tokio::test]

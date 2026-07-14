@@ -11,7 +11,11 @@ use relascope_core::workspace::{
     database_path, ensure_state_dir, find_workspace_root, load_workspace_config,
     write_workspace_config, CONFIG_FILE,
 };
-use relascope_storage_sqlite::SqliteStore;
+use relascope_storage_sqlite::{
+    MinimalGraphMaterializationProgress, MinimalGraphMaterializationProgressReporter,
+    ShallowImportMaterializationProgress, ShallowImportMaterializationProgressReporter,
+    SqliteStore,
+};
 use serde_json::json;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -410,6 +414,7 @@ async fn scan(args: ScanArgs) -> Result<()> {
         return Ok(());
     }
 
+    report_scan_stage(progress_enabled, "Persisting inventory");
     context
         .store
         .persist_scan_files(&outcome.files)
@@ -425,6 +430,7 @@ async fn scan(args: ScanArgs) -> Result<()> {
         return Ok(());
     }
 
+    report_scan_stage(progress_enabled, "Marking stale graph facts");
     context
         .store
         .mark_stale_for_file_changes(&context.config.workspace.id, &changes)
@@ -440,12 +446,21 @@ async fn scan(args: ScanArgs) -> Result<()> {
         return Ok(());
     }
 
-    context
+    report_scan_stage(progress_enabled, "Materializing graph");
+    let mut graph_reporter = CliMinimalGraphMaterializationProgressReporter::new(progress_enabled);
+    let graph_cancelled = context
         .store
-        .materialize_minimal_graph(&context.config, &repositories, &outcome.files, &scan_id)
+        .materialize_minimal_graph_with_control(
+            &context.config,
+            &repositories,
+            &outcome.files,
+            &scan_id,
+            Some(&cancellation),
+            &mut graph_reporter,
+        )
         .await
         .context("failed to materialize minimal graph")?;
-    if cancellation.is_cancelled() {
+    if graph_cancelled || cancellation.is_cancelled() {
         context
             .store
             .finish_scan(&scan_id, "cancelled", &outcome.summary)
@@ -455,11 +470,30 @@ async fn scan(args: ScanArgs) -> Result<()> {
         return Ok(());
     }
 
-    context
+    report_scan_stage(progress_enabled, "Materializing shallow imports");
+    let mut import_reporter =
+        CliShallowImportMaterializationProgressReporter::new(progress_enabled);
+    let shallow_imports_cancelled = context
         .store
-        .materialize_shallow_imports(&context.config, &repositories, &outcome.files, &scan_id)
+        .materialize_shallow_imports_with_control(
+            &context.config,
+            &repositories,
+            &outcome.files,
+            &scan_id,
+            Some(&cancellation),
+            &mut import_reporter,
+        )
         .await
         .context("failed to materialize shallow imports")?;
+    if shallow_imports_cancelled || cancellation.is_cancelled() {
+        context
+            .store
+            .finish_scan(&scan_id, "cancelled", &outcome.summary)
+            .await
+            .context("failed to mark scan as cancelled")?;
+        eprintln!("Scan cancelled");
+        return Ok(());
+    }
     context
         .store
         .finish_scan(&scan_id, "completed", &outcome.summary)
@@ -501,6 +535,12 @@ async fn scan(args: ScanArgs) -> Result<()> {
     Ok(())
 }
 
+fn report_scan_stage(enabled: bool, stage: &str) {
+    if enabled {
+        println!("{stage}...");
+    }
+}
+
 struct CliScanProgressReporter {
     enabled: bool,
 }
@@ -537,6 +577,64 @@ impl ScanProgressReporter for CliScanProgressReporter {
                 );
             }
         }
+    }
+}
+
+struct CliMinimalGraphMaterializationProgressReporter {
+    enabled: bool,
+}
+
+impl CliMinimalGraphMaterializationProgressReporter {
+    fn new(enabled: bool) -> Self {
+        Self { enabled }
+    }
+}
+
+impl MinimalGraphMaterializationProgressReporter
+    for CliMinimalGraphMaterializationProgressReporter
+{
+    fn report(&mut self, progress: MinimalGraphMaterializationProgress) {
+        if !self.enabled {
+            return;
+        }
+
+        println!(
+            "  graph: {}/{} files, {}/{} repositories, elapsed {}",
+            progress.files_processed,
+            progress.total_files,
+            progress.repositories_processed,
+            progress.total_repositories,
+            format_duration(progress.elapsed)
+        );
+    }
+}
+
+struct CliShallowImportMaterializationProgressReporter {
+    enabled: bool,
+}
+
+impl CliShallowImportMaterializationProgressReporter {
+    fn new(enabled: bool) -> Self {
+        Self { enabled }
+    }
+}
+
+impl ShallowImportMaterializationProgressReporter
+    for CliShallowImportMaterializationProgressReporter
+{
+    fn report(&mut self, progress: ShallowImportMaterializationProgress) {
+        if !self.enabled {
+            return;
+        }
+
+        println!(
+            "  imports {}: {}/{} code files, {} imports, elapsed {}",
+            progress.repository_visible_id,
+            progress.files_processed,
+            progress.total_code_files,
+            progress.imports_materialized,
+            format_duration(progress.elapsed)
+        );
     }
 }
 
